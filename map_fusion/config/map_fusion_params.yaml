@@ -1,0 +1,24 @@
+# 几何拼接地图融合节点参数配置
+geometry_map_fusion_node:
+  ros__parameters:
+    # 融合算法参数
+    occ_threshold: 65                    # 障碍判定阈值（>=65视为障碍）
+    binarize_write: false                # 是否将障碍值二值化为100
+    enable_debug_logging: true           # 启用调试日志输出
+    
+    # 基础参数（保留兼容性）
+    boundary_width: 3                    # 保留（未来可能用于边界处理）
+    
+    # 输入话题配置
+    base_map_topic: "/lidar_map"         # 基础地图话题（LRF生成）
+    affixion_map_topic: "/depth_map"     # 附加地图话题（伪激光生成）
+    
+    # 输出话题配置  
+    fused_map_topic: "/fused_map"        # 融合后地图话题
+    
+    # 融合参数
+    enable_boundary_protection: true     # 启用边界保护
+    
+    # 调试选项
+    publish_debug_info: true             # 发布调试信息
+    log_fusion_stats: true               # 记录融合统计信息

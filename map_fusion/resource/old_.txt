@@ -1,0 +1,326 @@
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import OccupancyGrid
+import numpy as np
+from typing import Optional
+
+
+class ORBMapFusionNode(Node):
+    """
+    几何拼接地图融合（不要求两图尺寸一致）。
+    - 使用各自的 origin + resolution 计算世界覆盖范围并取并集生成新画布；
+    - 若两图 resolution 不一致，先将“附加图”用最近邻重采样到“基础图”的分辨率（保持占据信息语义）；
+    - 冲突裁决：障碍(100) > 空闲(0) > 未知(-1)，冲突时保留基础图优先；
+    - 订阅 /base_map 与 /affixion_map（可通过 launch 重映射到 /lidar_map 与 /depth_map）。
+    """
+
+    def __init__(self):
+        super().__init__('geometry_map_fusion_node')
+
+        # 订阅基础地图和附加地图（通过launch可重映射）
+        self.sub_mb = self.create_subscription(
+            OccupancyGrid, '/base_map', self.mb_callback, 10
+        )
+        self.sub_ma = self.create_subscription(
+            OccupancyGrid, '/affixion_map', self.ma_callback, 10
+        )
+
+        # 发布融合后的地图
+        self.pub_fused_map = self.create_publisher(OccupancyGrid, '/fused_map', 10)
+
+        # 缓存
+        self.mb: Optional[OccupancyGrid] = None
+        self.ma: Optional[OccupancyGrid] = None
+
+        self.get_logger().info('Geometry-based Map Fusion Node initialized')
+
+    def mb_callback(self, msg: OccupancyGrid):
+        self.mb = msg
+        self.try_fusion()
+
+    def ma_callback(self, msg: OccupancyGrid):
+        self.ma = msg
+        self.try_fusion()
+
+    # def try_fusion(self):
+    #     if self.mb is None or self.ma is None:
+    #         return
+
+    #     # 调试信息：打印两图的基础信息
+    #     self.get_logger().info(
+    #         f"Base map: origin=({self.mb.info.origin.position.x:.2f}, {self.mb.info.origin.position.y:.2f}), "
+    #         f"size={self.mb.info.width}x{self.mb.info.height}, res={self.mb.info.resolution:.3f}"
+    #     )
+    #     self.get_logger().info(
+    #         f"Add map: origin=({self.ma.info.origin.position.x:.2f}, {self.ma.info.origin.position.y:.2f}), "
+    #         f"size={self.ma.info.width}x{self.ma.info.height}, res={self.ma.info.resolution:.3f}"
+    #     )
+        
+    #     # 检查附加地图的数据分布
+    #     ma_data = np.array(self.ma.data, dtype=np.int16)
+    #     occupied_count = np.sum(ma_data == 100)
+    #     free_count = np.sum(ma_data == 0)
+    #     unknown_count = np.sum(ma_data == -1)
+    #     other_count = len(ma_data) - occupied_count - free_count - unknown_count
+        
+    #     self.get_logger().info(
+    #         f"Add map stats: total={len(ma_data)}, occupied={occupied_count}, "
+    #         f"free={free_count}, unknown={unknown_count}, other={other_count}"
+    #     )
+        
+    #     # 计算覆盖范围
+    #     w_b = self.mb.info.width * self.mb.info.resolution
+    #     h_b = self.mb.info.height * self.mb.info.resolution
+    #     w_a = self.ma.info.width * self.ma.info.resolution  
+    #     h_a = self.ma.info.height * self.ma.info.resolution
+        
+    #     self.get_logger().info(
+    #         f"World coverage - Base: {w_b:.1f}x{h_b:.1f}m, Add: {w_a:.1f}x{h_a:.1f}m"
+    #     )
+
+    #     fused = self.geometry_based_fusion(self.mb, self.ma)
+    #     if fused is not None:
+    #         fused.header.stamp = self.get_clock().now().to_msg()
+    #         self.pub_fused_map.publish(fused)
+    #         self.get_logger().info(
+    #             f'Fused map published: size={fused.info.width}x{fused.info.height}, res={fused.info.resolution:.3f}'
+    #         )
+
+    def try_fusion(self):
+        if self.mb is None or self.ma is None:
+            return
+
+        # 调试信息：打印两图的基础信息
+        self.get_logger().info(
+            f"Base map: origin=({self.mb.info.origin.position.x:.2f}, {self.mb.info.origin.position.y:.2f}), "
+            f"size={self.mb.info.width}x{self.mb.info.height}, res={self.mb.info.resolution:.3f}"
+        )
+        self.get_logger().info(
+            f"Add map: origin=({self.ma.info.origin.position.x:.2f}, {self.ma.info.origin.position.y:.2f}), "
+            f"size={self.ma.info.width}x{self.ma.info.height}, res={self.ma.info.resolution:.3f}"
+        )
+        
+        # 检查附加地图的数据分布（详细版本）
+        ma_data = np.array(self.ma.data, dtype=np.int16)
+        occupied_count = np.sum(ma_data == 100)
+        free_count = np.sum(ma_data == 0)
+        unknown_count = np.sum(ma_data == -1)
+        other_count = len(ma_data) - occupied_count - free_count - unknown_count
+        
+        # 找出非标准值都是什么
+        unique_vals, counts = np.unique(ma_data, return_counts=True)
+        val_stats = dict(zip(unique_vals, counts))
+        
+        # 找到最大的障碍值（排除-1）
+        valid_vals = ma_data[ma_data > -1]
+        if len(valid_vals) > 0:
+            max_obstacle = np.max(valid_vals)
+            min_obstacle = np.min(valid_vals)
+        else:
+            max_obstacle = -1
+            min_obstacle = -1
+        
+        self.get_logger().info(
+            f"Add map stats: total={len(ma_data)}, occupied={occupied_count}, "
+            f"free={free_count}, unknown={unknown_count}, other={other_count}"
+        )
+        
+        self.get_logger().info(f"Add map unique values: {val_stats}")
+        self.get_logger().info(f"Add map obstacle range: min={min_obstacle}, max={max_obstacle}")
+        
+        # 计算覆盖范围
+        w_b = self.mb.info.width * self.mb.info.resolution
+        h_b = self.mb.info.height * self.mb.info.resolution
+        w_a = self.ma.info.width * self.ma.info.resolution  
+        h_a = self.ma.info.height * self.ma.info.resolution
+        
+        self.get_logger().info(
+            f"World coverage - Base: {w_b:.1f}x{h_b:.1f}m, Add: {w_a:.1f}x{h_a:.1f}m"
+        )
+
+        fused = self.geometry_based_fusion(self.mb, self.ma)
+        if fused is not None:
+            fused.header.stamp = self.get_clock().now().to_msg()
+            self.pub_fused_map.publish(fused)
+            self.get_logger().info(
+                f'Fused map published: size={fused.info.width}x{fused.info.height}, res={fused.info.resolution:.3f}'
+            )
+
+    def resample_occupancy_grid_nn(self, og: OccupancyGrid, target_res: float) -> OccupancyGrid:
+        """
+        将占据栅格用最近邻重采样到目标分辨率（保持语义：障碍/空闲/未知）。
+        - origin 与坐标系不变，仅修改 width/height/resolution 与 data。
+        """
+        src_res = float(og.info.resolution)
+        if target_res <= 0.0 or src_res <= 0.0:
+            return og
+        if abs(src_res - target_res) <= 1e-12:
+            return og  # 无需重采样
+
+        src_w, src_h = int(og.info.width), int(og.info.height)
+        # 世界宽高保持不变 -> 新尺寸按比例缩放
+        world_w = src_w * src_res
+        world_h = src_h * src_res
+        dst_w = max(1, int(np.round(world_w / target_res)))
+        dst_h = max(1, int(np.round(world_h / target_res)))
+
+        src = np.array(og.data, dtype=np.int16).reshape(src_h, src_w)
+        dst = np.full((dst_h, dst_w), -1, dtype=np.int16)
+
+        # 使用cell中心映射到原图，并取最近邻（用floor等价）
+        for iy in range(dst_h):
+            y = (iy + 0.5) * target_res
+            src_iy = int(np.floor(y / src_res))
+            src_iy = min(max(src_iy, 0), src_h - 1)
+            src_row = src[src_iy]
+            dst_row = dst[iy]
+            for ix in range(dst_w):
+                x = (ix + 0.5) * target_res
+                src_ix = int(np.floor(x / src_res))
+                src_ix = min(max(src_ix, 0), src_w - 1)
+                dst_row[ix] = src_row[src_ix]
+
+        # 组装新的 OccupancyGrid
+        new_og = OccupancyGrid()
+        new_og.header = og.header
+        new_og.info = og.info
+        new_og.info.resolution = float(target_res)
+        new_og.info.width = int(dst_w)
+        new_og.info.height = int(dst_h)
+        # origin 不变（世界坐标一致）
+        new_og.data = np.clip(dst, -1, 100).astype(np.int8).flatten().tolist()
+        return new_og
+
+    def geometry_based_fusion(self, mb: OccupancyGrid, ma: OccupancyGrid) -> Optional[OccupancyGrid]:
+        """
+        使用几何信息（origin + resolution）进行拼接融合：
+        - 不要求两图尺寸一致；
+        - 若分辨率不一致，先将“附加图”重采样到“基础图”的分辨率（最近邻）；
+        - 新画布的origin取两幅地图覆盖区域的全局最小坐标，尺寸取并集范围；
+        - 融合规则：障碍(100) > 空闲(0) > 未知(-1)，冲突时优先基础图。
+        """
+        # 1) 若分辨率不同，先把附加图重采样到基础分辨率
+        res_b = float(mb.info.resolution)
+        res_a = float(ma.info.resolution)
+        if res_b <= 0.0 or res_a <= 0.0:
+            self.get_logger().warn('[geometry_based_fusion] Invalid resolution, return base map.')
+            return mb
+        if abs(res_b - res_a) > 1e-9:
+            self.get_logger().warn(
+                f"[geometry_based_fusion] Resolution mismatch: base={res_b}, add={res_a}. Resample additional to base."
+            )
+            ma = self.resample_occupancy_grid_nn(ma, res_b)
+
+        res = float(mb.info.resolution)
+
+        # 2) 计算两图的世界覆盖范围（min_x/min_y/max_x/max_y）
+        ox_b, oy_b = float(mb.info.origin.position.x), float(mb.info.origin.position.y)
+        w_b, h_b = int(mb.info.width), int(mb.info.height)
+        maxx_b, maxy_b = ox_b + w_b * res, oy_b + h_b * res
+
+        ox_a, oy_a = float(ma.info.origin.position.x), float(ma.info.origin.position.y)
+        w_a, h_a = int(ma.info.width), int(ma.info.height)
+        maxx_a, maxy_a = ox_a + w_a * res, oy_a + h_a * res
+
+        min_x = min(ox_b, ox_a)
+        min_y = min(oy_b, oy_a)
+        max_x = max(maxx_b, maxx_a)
+        max_y = max(maxy_b, maxy_a)
+
+        fused_w = int(np.ceil((max_x - min_x) / res))
+        fused_h = int(np.ceil((max_y - min_y) / res))
+        if fused_w <= 0 or fused_h <= 0:
+            self.get_logger().warn("[geometry_based_fusion] Computed fused canvas has non-positive size, return base map.")
+            return mb
+
+        # 3) 初始化融合画布为未知(-1)
+        fused = np.full((fused_h, fused_w), -1, dtype=np.int16)
+
+        # 4) 准备数据为二维数组
+        mb_data = np.array(mb.data, dtype=np.int16).reshape(h_b, w_b)
+        ma_data = np.array(ma.data, dtype=np.int16).reshape(h_a, w_a)
+
+        # 新增：障碍判定阈值与写入模式
+        occ_threshold = 65  # >=65 视为障碍，可根据需要调整
+        binarize_write = False  # True则把“障碍”写为100；False则保留原始值(如80)
+
+        def is_occ(v: int) -> bool:
+            return v == 100 or (1 <= v <= 99 and v >= occ_threshold)
+
+        # 5) 贴图工具：将一幅地图按 origin 对齐贴到融合画布
+        def paste_map(src_data: np.ndarray, ox: float, oy: float, prefer_existing: bool):
+            sh, sw = src_data.shape
+            # 将地图索引(ix,iy)映射到融合画布索引(tx,ty)，以cell左下角对齐，行0对应min_y方向
+            offset_x = (ox - min_x) / res
+            offset_y = (oy - min_y) / res
+
+            for iy in range(sh):
+                ty = int(np.floor(iy + offset_y + 1e-9))
+                if ty < 0 or ty >= fused_h:
+                    continue
+                row_src = src_data[iy]
+                row_dst = fused[ty]
+                for ix in range(sw):
+                    tx = int(np.floor(ix + offset_x + 1e-9))
+                    if tx < 0 or tx >= fused_w:
+                        continue
+                    val = row_src[ix]
+                    if val < -1 or val > 100:
+                        continue  # 非法值忽略
+                    if val == -1:
+                        continue  # 未知不覆盖
+
+                    cur = row_dst[tx]
+                    if cur == -1:
+                        # 画布为空：直接写入（是否二值化由开关控制）
+                        row_dst[tx] = 100 if (binarize_write and is_occ(val)) else val
+                        continue
+
+                    if prefer_existing:
+                        # 画布已有值优先，但若新值“被视为障碍”而当前不算障碍，可升级
+                        if is_occ(val) and not is_occ(cur):
+                            row_dst[tx] = 100 if binarize_write else val
+                        continue
+
+                    # 冲突裁决（基础优先 + 障碍优先），用阈值判断“障碍”
+                    if is_occ(cur) or is_occ(val):
+                        # 有一方是障碍：保留原始值或写100
+                        row_dst[tx] = 100 if binarize_write else (val if is_occ(val) else cur)
+                    elif cur == 0 and val == 0:
+                        row_dst[tx] = 0
+                    else:
+                        row_dst[tx] = cur  # 保留已有（基础优先）
+
+        # 6) 先贴基础图，再贴附加图
+        paste_map(mb_data, ox_b, oy_b, prefer_existing=True)
+        paste_map(ma_data, ox_a, oy_a, prefer_existing=False)
+
+        # 7) 生成 OccupancyGrid
+        fused_map = OccupancyGrid()
+        fused_map.header = mb.header  # 保持frame_id一致
+        fused_map.header.stamp = self.get_clock().now().to_msg()
+        fused_map.info.resolution = res
+        fused_map.info.width = fused_w
+        fused_map.info.height = fused_h
+        fused_map.info.origin.position.x = float(min_x)
+        fused_map.info.origin.position.y = float(min_y)
+        fused_map.info.origin.position.z = 0.0
+        fused_map.info.origin.orientation.x = 0.0
+        fused_map.info.origin.orientation.y = 0.0
+        fused_map.info.origin.orientation.z = 0.0
+        fused_map.info.origin.orientation.w = 1.0
+
+        fused_map.data = np.clip(fused, -1, 100).astype(np.int8).flatten().tolist()
+        return fused_map
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ORBMapFusionNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

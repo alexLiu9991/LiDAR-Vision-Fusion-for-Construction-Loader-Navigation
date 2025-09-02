@@ -1,0 +1,37 @@
+# 激光雷达融合节点参数配置
+scan_fusion_node:
+  ros__parameters:
+    # 输入话题
+    scan1_topic: "/scan_lidar"              # 真实激光雷达话题
+    scan2_topic: "/scan_depth"              # 伪激光雷达话题（来自深度图像转换）
+    output_topic: "/scan"        # 融合后输出话题
+    
+    # 坐标系
+    target_frame: "base_footprint"     # 目标坐标系
+    
+    # 输出激光扫描参数
+    # grid_angle_min: -3.14159           # 最小角度 (-π)
+    # grid_angle_max: 3.14159            # 最大角度 (π)
+    grid_angle_min: -1.0           # 最小角度 (-π)
+    grid_angle_max: 1.0            # 最大角度 (π)
+    grid_angle_increment: 0.004363323  # 角度增量 (0.25度)
+    
+    # 距离范围
+    range_min: 0.05                    # 最小距离
+    range_max: 30.0                    # 最大距离
+    
+    # 融合策略
+    fusion_mode: "min"                 # 融合模式: "min" 或 "weighted"
+    weight_scan1: 1.0                  # 真实激光雷达权重
+    weight_scan2: 0.8                  # 伪激光雷达权重（较小）
+    
+    # 处理选项
+    use_inf_for_no_data: true          # 无数据时使用无穷大
+    fill_intensities: true             # 填充强度信息（用于标识数据源）
+    
+    # 同步参数
+    queue_size: 10                     # 消息队列大小
+    slop: 0.05                         # 时间同步容差（50ms）
+    
+    # TF参数
+    tf_timeout: 0.2                    # TF查找超时时间
